@@ -1,0 +1,161 @@
+x-spark: &spark
+  build: ./docker
+  image: quakes/spark:latest
+  pull_policy: build
+  volumes:
+    - ./work:/home/jovyan/work 
+  networks: [bigdata]
+
+services:
+
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: kafka
+    hostname: kafka
+    ports:
+      - "9094:9094"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms512m"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+    networks: [bigdata]
+
+  kafka-init:
+    image: apache/kafka:3.9.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092
+        --create --if-not-exists --topic quakes_raw
+        --partitions 3 --replication-factor 1 &&
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic quakes_raw
+    restart: "no"
+    networks: [bigdata]
+
+  # persistance
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: namenode
+    hostname: namenode
+    ports:
+      - "9870:9870"
+      - "9000:9000"
+    environment:
+      CLUSTER_NAME: quakes
+    env_file: ./hadoop.env
+    volumes:
+      - namenode:/hadoop/dfs/name
+    networks: [bigdata]
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode
+    hostname: datanode
+    ports:
+      - "9864:9864"
+    environment:
+      SERVICE_PRECONDITION: "namenode:9870"
+    env_file: ./hadoop.env
+    volumes:
+      - datanode:/hadoop/dfs/data
+    depends_on: [namenode]
+    networks: [bigdata]
+
+  # traitement
+  spark-master:
+    <<: *spark
+    container_name: spark-master
+    hostname: spark-master
+    command: /usr/local/spark/bin/spark-class org.apache.spark.deploy.master.Master --host spark-master --port 7077 --webui-port 8080
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+
+  spark-worker:
+    <<: *spark
+    container_name: spark-worker
+    hostname: spark-worker
+    command: /usr/local/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077 --cores 2 --memory 3g --webui-port 8081 --work-dir /tmp/spark-work
+    ports:
+      - "8081:8081"
+    depends_on: [spark-master]
+
+  notebook:
+    <<: *spark
+    container_name: notebook
+    hostname: notebook
+    ports:
+      - "8888:8888"
+      - "4040:4040"
+      - "4041:4041"
+    environment:
+      PG_HOST: postgres
+      PG_DB: quakes
+      PG_USER: etl_writer
+      PG_PASSWORD: etl_writer
+    command: start-notebook.sh --IdentityProvider.token='' --ServerApp.password=''
+    depends_on: [spark-master, kafka, namenode, postgres]
+
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    hostname: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: quakes
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro 
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d quakes"]
+      interval: 5s
+      retries: 10
+    networks: [bigdata]
+
+  dashboard:
+    build: ./dashboard
+    container_name: dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      PG_HOST: postgres
+      PG_DB: quakes
+      PG_USER: dashboard_reader 
+      PG_PASSWORD: dashboard_reader
+    volumes:
+      - ./dashboard:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [bigdata]
+
+volumes:
+  namenode:
+  datanode:
+  pgdata:
+
+networks:
+  bigdata:
