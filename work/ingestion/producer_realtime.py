@@ -1,13 +1,17 @@
 """
-ingestion streaming : récupération en streaming des données quake -> kafka (topic quakes_raw)
+ingestion streaming : feed temps réel USGS -> kafka (topic quakes_raw)
 
-- l'argument' "all_hour" contient tous les séismes de la dernière heure, les données se récupèrent toutes les minutes
+- le feed "all_hour" contient tous les séismes de la dernière heure, mis à jour ~chaque minute
 - on l'interroge toutes les 60 s -> d'un appel à l'autre, ~59 minutes de séismes sont DÉJÀ connues
-- il est possible que l'USGS MAJ un séisme (ex: magnitude, coordonnées, etc.) -> le champ `updated` change
+- et l'USGS révise souvent un séisme après coup (magnitude corrigée, statut "reviewed"...)
+  -> le champ `updated` change
 
-On envoie un séisme si nouveau ou a mettre jour si l'ajout du séisme date de moins de 3h
-c'est une première couche de dédoublonnage ;
-(spark garde la version la plus récente par id)
+donc on n'envoie un séisme que s'il est nouveau OU si son `updated` a changé.
+c'est une première couche de dédoublonnage ; la vraie garantie est en aval
+(spark garde la version la plus récente par id, postgres fait un upsert).
+
+clé du message kafka = id du séisme -> toutes les versions d'un même séisme
+tombent dans la même partition, donc dans l'ordre.
 
 usage (terminal jupyter) :
     cd ~/work
@@ -26,17 +30,15 @@ from kafka import KafkaProducer
 FEED_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson"
 TOPIC = "quakes_raw"
 BOOTSTRAP = "kafka:9092"
-INTERVAL_S = 60 # Intervalle de récupération des séismes (en secondes)
-FORGET_AFTER_MS = 3 * 3600 * 1000   # On oublie les séismes vus il y a + de 3 h (mémoire bornée)
+INTERVAL_S = 60
+FORGET_AFTER_MS = 3 * 3600 * 1000
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("producer")
 
-"""
-Mis à jour ou ajout de séisme à mettre dans le flux Kafka
-"""
+
 def new_or_updated(features, seen: dict) -> list:
-    """Garde les features jamais vues ou dont la version (updated) a changé. met à jour `seen`."""
+    """garde les features jamais vues ou dont la version (updated) a changé. met à jour `seen`."""
     out = []
     for f in features:
         fid, upd = f["id"], f["properties"].get("updated")
@@ -45,9 +47,7 @@ def new_or_updated(features, seen: dict) -> list:
             out.append(f)
     return out
 
-"""
-Mécanisme d'oublie de séismes vus il y a longtemps (mémoire bornée)
-"""
+
 def forget_old(seen: dict, now_ms: int):
     for fid in [k for k, upd in seen.items() if upd is None or now_ms - upd > FORGET_AFTER_MS]:
         del seen[fid]
@@ -58,7 +58,7 @@ def main():
         bootstrap_servers=BOOTSTRAP,
         key_serializer=lambda k: k.encode("utf-8"),
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-        acks="all",          
+        acks="all",
         retries=5,
         linger_ms=50,
     )
@@ -91,7 +91,6 @@ def main():
                      len(feed["features"]), len(to_send), len(seen))
         except (requests.RequestException, ValueError, KeyError) as e:
             log.warning("échec de l'appel au feed : %s (on réessaie au prochain tour)", e)
-        # on temporise pour que le prochain appel se fasse toutes les INTERVAL_S secondes
         while running and time.monotonic() - t0 < INTERVAL_S:
             time.sleep(1)
 

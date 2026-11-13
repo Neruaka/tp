@@ -52,7 +52,6 @@ services:
     restart: "no"
     networks: [bigdata]
 
-  # persistance
   namenode:
     image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
     container_name: namenode
@@ -81,7 +80,6 @@ services:
     depends_on: [namenode]
     networks: [bigdata]
 
-  # traitement
   spark-master:
     <<: *spark
     container_name: spark-master

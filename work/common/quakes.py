@@ -1,6 +1,5 @@
 """
-Document reference sur la connexion des données et les paths
-La logique est partagé entre la logique géré par Spark et celle testee par le producteur kafka. Il y a
+logique partagée entre le job streaming et le job silver.
 une seule définition du schéma et du nettoyage -> batch et streaming produisent EXACTEMENT les mêmes colonnes.
 """
 import os
@@ -16,22 +15,18 @@ SILVER = f"{HDFS}/datalake/silver/earthquakes"
 GOLD = f"{HDFS}/datalake/gold"
 CHECKPOINTS = f"{HDFS}/datalake/_checkpoints"
 
-#Data warehouse: postgres
 PG_URL = (f"jdbc:postgresql://{os.getenv('PG_HOST', 'postgres')}:{os.getenv('PG_PORT', '5432')}"
           f"/{os.getenv('PG_DB', 'quakes')}")
 PG_PROPS = {"user": os.getenv("PG_USER", "etl_writer"), "password": os.getenv("PG_PASSWORD", "etl_writer"),
             "driver": "org.postgresql.Driver"}
 
-# Schéma GEOJSONS des séismes rapportés par l'API USGS
-# On l'impose à la lecture ("schema on read" du cours) : spark n'a pas à le deviner,
-# et un champ inattendu ne casse rien ou typage non-correct.
 FEATURE_SCHEMA = StructType([
     StructField("id", StringType()),
     StructField("properties", StructType([
         StructField("mag", DoubleType()),
         StructField("magType", StringType()),
         StructField("place", StringType()),
-        StructField("time", LongType()),        # epoch Linux en millisecondes
+        StructField("time", LongType()),
         StructField("updated", LongType()),
         StructField("felt", IntegerType()),
         StructField("alert", StringType()),
@@ -46,7 +41,7 @@ FEATURE_SCHEMA = StructType([
         StructField("url", StringType()),
     ])),
     StructField("geometry", StructType([
-        StructField("coordinates", ArrayType(DoubleType())),   # [lon, lat, profondeur_km]
+        StructField("coordinates", ArrayType(DoubleType())),
     ])),
     StructField("_lineage", StructType([
         StructField("source", StringType()),
@@ -116,5 +111,5 @@ def quality_filter(df: DataFrame) -> DataFrame:
         & F.col("lat").between(-90, 90)
         & F.col("lon").between(-180, 180)
         & F.col("mag").isNotNull() & F.col("mag").between(-2, 10)
-        & F.col("depth_km").between(-10, 800)    # négatif possible : au-dessus du niveau de la mer
+        & F.col("depth_km").between(-10, 800)
     )

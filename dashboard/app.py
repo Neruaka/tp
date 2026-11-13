@@ -5,6 +5,7 @@ lit UNIQUEMENT le data warehouse postgres (jamais le data lake), avec un user en
 onglets :
   - temps réel        : dw.live_quakes (alimentée par le streaming), rafraîchie toutes les 60 s
   - analyses          : le gold en étoile (fact_earthquake + dimensions) et les agrégats pré-calculés
+  - zones sismiques   : résultat du clustering KMeans (dw.ml_zones), si le job ML a tourné
 """
 import os
 
@@ -23,7 +24,7 @@ PG = dict(host=os.getenv("PG_HOST", "postgres"), port=int(os.getenv("PG_PORT", "
 MAG_ORDER = ["micro", "mineur", "léger", "modéré", "fort", "majeur", "grand"]
 
 
-@st.cache_data(ttl=30)   # cache 30 s : 10 onglets ouverts ne font pas 10 requêtes
+@st.cache_data(ttl=30)
 def query(sql: str, params: tuple = ()) -> pd.DataFrame:
     conn = psycopg2.connect(**PG)
     try:
@@ -43,9 +44,8 @@ st.caption("source : USGS earthquake catalog · pipeline kafka → spark → HDF
 
 tab_live, tab_analyse = st.tabs(["temps réel", "analyses historiques"])
 
-# =========================================================================== temps réel
 with tab_live:
-    @st.fragment(run_every=60)          # ce bloc se rafraîchit seul toutes les 60 s
+    @st.fragment(run_every=60)
     def live():
         df = query("""
             SELECT event_id, event_time, mag, place, region, lon, lat, depth_km, status, tsunami, url
@@ -62,7 +62,7 @@ with tab_live:
         c3.metric("M4.5+", int((df.mag >= 4.5).sum()))
         c4.metric("dernier", pd.to_datetime(df.event_time.max()).strftime("%H:%M UTC"))
 
-        df["taille"] = (df.mag.clip(lower=0) + 1) ** 2   # aire du point ~ magnitude
+        df["taille"] = (df.mag.clip(lower=0) + 1) ** 2
         fig = px.scatter_geo(df, lat="lat", lon="lon", size="taille", color="mag",
                              color_continuous_scale="YlOrRd", hover_name="place",
                              hover_data={"mag": ":.1f", "depth_km": ":.0f", "taille": False, "lat": False, "lon": False},
@@ -76,7 +76,6 @@ with tab_live:
                      column_config={"url": st.column_config.LinkColumn("fiche USGS")})
     live()
 
-# =========================================================================== analyses
 with tab_analyse:
     span = query("SELECT min(year) AS lo, max(year) AS hi FROM dw.dim_date")
     if span.lo.isna()[0]:
@@ -89,10 +88,8 @@ with tab_analyse:
                             help="sous M2.5 le catalogue est dominé par les USA (bien plus de capteurs) : "
                                  "ça fausse les comparaisons entre régions")
         p = (years[0], years[1], min_mag)
-        # le filtre commun : jointure fait -> dimension date (c'est tout l'intérêt de l'étoile)
         WHERE = "d.year BETWEEN %s AND %s AND f.mag >= %s"
 
-        # ---- chiffres clés
         k = query(f"""
             SELECT count(*) AS n, count(*) FILTER (WHERE f.mag >= 6) AS n6,
                    count(*) FILTER (WHERE f.tsunami) AS n_tsu, max(f.mag) AS mmax
@@ -103,7 +100,6 @@ with tab_analyse:
         c3.metric("avec alerte tsunami", f"{int(k.n_tsu[0]):,}".replace(",", " "))
         c4.metric("magnitude max", f"{k.mmax[0]:.1f}" if k.mmax[0] is not None else "-")
 
-        # ---- évolution annuelle par classe de magnitude
         st.subheader("combien de séismes par an ?")
         evo = query(f"""
             SELECT d.year, m.label, count(*) AS n
@@ -115,7 +111,6 @@ with tab_analyse:
         fig.update_layout(height=380, margin=dict(t=10))
         st.plotly_chart(fig, use_container_width=True)
 
-        # ---- heatmap région × année
         st.subheader("où et quand ? les 15 régions les plus actives")
         heat = query(f"""
             WITH top AS (
@@ -127,7 +122,7 @@ with tab_analyse:
             WHERE {WHERE} GROUP BY r.region, d.year""", p + p)
         if not heat.empty:
             pivot = heat.pivot(index="region", columns="year", values="n").fillna(0)
-            pivot = pivot.loc[pivot.sum(axis=1).sort_values().index]      # la plus active en haut
+            pivot = pivot.loc[pivot.sum(axis=1).sort_values().index]
             fig = px.imshow(pivot, aspect="auto", color_continuous_scale="YlOrRd",
                             labels=dict(x="", y="", color="séismes"))
             fig.update_layout(height=480, margin=dict(t=10))
@@ -135,15 +130,11 @@ with tab_analyse:
 
         col_a, col_b = st.columns(2)
 
-        # ---- gutenberg-richter
         with col_a:
             st.subheader("la loi de gutenberg-richter")
             gr = query("SELECT mag_bin, n_quakes FROM dw.agg_mag_distribution ORDER BY mag_bin")
             gr = gr[gr.n_quakes > 0].copy()
-            # N(>= M) : nombre cumulé de séismes de magnitude au moins M
             gr["n_cum"] = gr.n_quakes[::-1].cumsum()[::-1]
-            # magnitude de complétude Mc : le bin le plus peuplé (méthode "max curvature").
-            # en dessous, le catalogue rate des séismes trop petits pour être détectés partout
             mc = float(gr.loc[gr.n_quakes.idxmax(), "mag_bin"])
             fit = gr[(gr.mag_bin >= mc) & (gr.n_cum >= 10)]
             b, a = np.polyfit(fit.mag_bin, np.log10(fit.n_cum), 1)
@@ -158,7 +149,6 @@ with tab_analyse:
             st.caption(f"b = {-b:.2f} (attendu ≈ 1 en sismologie) · complétude Mc ≈ {mc:.1f} · "
                        "chaque point de magnitude en plus = environ 10 fois moins de séismes")
 
-        # ---- profondeur vs magnitude
         with col_b:
             st.subheader("profondeur vs magnitude")
             dep = query(f"""
@@ -172,13 +162,12 @@ with tab_analyse:
                              category_orders={"profondeur": ["superficiel", "intermédiaire", "profond"]},
                              color_discrete_sequence=["#EF9F27", "#D85A30", "#712B13"],
                              labels={"mag": "magnitude", "depth_km": "profondeur (km)"})
-            fig.update_yaxes(autorange="reversed")      # la profondeur descend
+            fig.update_yaxes(autorange="reversed")
             fig.update_layout(height=420, margin=dict(t=10))
             st.plotly_chart(fig, use_container_width=True)
             st.caption("échantillon de 5 000 séismes M4.5+ · les séismes profonds (> 300 km) n'existent "
                        "que dans les zones de subduction")
 
-        # ---- top régions
         st.subheader("top 15 régions")
         top = query(f"""
             SELECT r.region, count(*) AS n, round(avg(f.mag)::numeric, 2) AS mag_moy, max(f.mag) AS mag_max
@@ -188,3 +177,4 @@ with tab_analyse:
                      color_continuous_scale="YlOrRd", labels={"n": "séismes", "region": "", "mag_moy": "mag. moy."})
         fig.update_layout(height=480, margin=dict(t=10))
         st.plotly_chart(fig, use_container_width=True)
+
